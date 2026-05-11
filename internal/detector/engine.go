@@ -469,6 +469,14 @@ func riskFlagBit(name string) uint32 {
 		return consumer.RFlagLargeMmap
 	case "http":
 		return consumer.RFlagHTTP
+	case "ssh_key":
+		return consumer.RFlagSSHKey
+	case "k8s_secret":
+		return consumer.RFlagK8sSecret
+	case "cloud_cred":
+		return consumer.RFlagCloudCred
+	case "canonical":
+		return consumer.RFlagCanonical
 	}
 	return 0
 }
