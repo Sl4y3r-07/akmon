@@ -95,6 +95,7 @@ var allLSMProgs = []lsmDef{
 	{"lsm_protect_inode", "lsm/inode_permission"},
 	{"lsm_protect_kill", "lsm/task_kill"},
 	{"lsm_protect_bpf_map", "lsm/bpf_map"},
+	{"lsm_file_open_classify", "lsm/file_open"},
 }
 
 // allTracepoints lists every tracepoint we attach.

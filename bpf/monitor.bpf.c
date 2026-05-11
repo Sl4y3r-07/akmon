@@ -161,6 +161,13 @@ struct {
     __type(value, struct net_event);
 } net_heap SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, char[MAX_PATH_LEN]);
+} path_heap SEC(".maps");
+
 
 /* ════════════════════════════════════════════════════════════════════════════
    HELPER FUNCTIONS
@@ -231,38 +238,55 @@ static __always_inline int rate_limit(__u32 pid, __u8 type)
     return 0;
 }
 
-/*
- * classify_path_buf — check a path that is already in BPF-accessible memory.
- *
- * Sensitive prefix detection done here in the kernel for two reasons:
- *   1. Lets us decide immediately whether to add fd to fd_track
- *   2. Sets risk_flags in the event without a userspace round-trip
- *
- * Model file extension detection (.pt, .gguf, .safetensors, .bin, .onnx)
- * is intentionally left for Go userspace — extension matching requires
- * iterating to the end of the string, which is expensive and verifier-
- * hostile in eBPF.
- */
+static __always_inline bool contains_needle(const char *p, const char *needle, int n)
+{
+    #pragma unroll
+    for (int i = 0; i + 16 <= MAX_PATH_LEN; i++) {
+        if (p[i] == '\0')
+            return false;
+        bool match = true;
+        #pragma unroll
+        for (int j = 0; j < 16; j++) {
+            if (j >= n) break;
+            if (p[i + j] != needle[j]) { match = false; break; }
+        }
+        if (match)
+            return true;
+    }
+    return false;
+}
+
+static __always_inline bool starts_with_n(const char *p, const char *prefix, int n)
+{
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        if (i >= n) return true;
+        if (p[i] != prefix[i]) return false;
+    }
+    return true;
+}
+
 static __always_inline __u32 classify_path_buf(const char *p)
 {
     __u32 flags = 0;
+    if (p[0] == '\0')
+        return 0;
 
-    /* /etc/ — system configuration */
-    if (p[0]=='/' && p[1]=='e' && p[2]=='t' && p[3]=='c' && p[4]=='/')
-        flags |= RFLAG_SENSITIVE;
+    if (starts_with_n(p, "/etc/",  5))  flags |= RFLAG_SENSITIVE;
+    if (starts_with_n(p, "/proc/", 6))  flags |= RFLAG_SENSITIVE;
+    if (starts_with_n(p, "/sys/",  5))  flags |= RFLAG_SENSITIVE;
+    if (starts_with_n(p, "/boot/", 6))  flags |= RFLAG_SENSITIVE;
 
-    /* /proc/ — kernel process information */
-    if (p[0]=='/' && p[1]=='p' && p[2]=='r' && p[3]=='o' &&
-        p[4]=='c' && p[5]=='/')
-        flags |= RFLAG_SENSITIVE;
+    /* Free-position needles — handle arbitrary path depth */
+    if (contains_needle(p, "/.ssh/", 6))
+        flags |= RFLAG_SENSITIVE | RFLAG_SSH_KEY;
 
-    /* /sys/ — kernel sysfs */
-    if (p[0]=='/' && p[1]=='s' && p[2]=='y' && p[3]=='s' && p[4]=='/')
-        flags |= RFLAG_SENSITIVE;
+    if (contains_needle(p, "/run/secrets/", 13))
+        flags |= RFLAG_SENSITIVE | RFLAG_K8S_SECRET;
 
-    /* /root/.ssh/ or /home/.../.ssh/ — SSH keys */
-    if (p[4]=='.' && p[5]=='s' && p[6]=='s' && p[7]=='h' && p[8]=='/')
-        flags |= RFLAG_SENSITIVE;
+    if (contains_needle(p, "/.aws/", 6) ||
+        contains_needle(p, "/.kube/", 7))
+        flags |= RFLAG_SENSITIVE | RFLAG_CLOUD_CRED;
 
     return flags;
 }
@@ -1257,6 +1281,75 @@ int BPF_PROG(lsm_protect_bpf_map, struct bpf_map *map, fmode_t fmode)
 }
 
 
-/* Required: declares this program is GPL-licensed,
- * enabling use of GPL-only BPF helpers. */
+/* ════════════════════════════════════════════════════════════════════════════
+   SECTION 7 — CANONICAL PATH CLASSIFICATION (LSM file_open hook)
+
+   Tracepoint-based classification (Section 2) operates on the raw userspace
+   string passed to openat. That misses three bypasses:
+
+     1. dirfd-relative open: openat(dirfd=/etc, "passwd", ...) — string is
+        "passwd", no /etc/ prefix.
+     2. Symlinks: ln -s /etc/passwd /tmp/x ; cat /tmp/x — string is /tmp/x.
+     3. Path traversal: /var/../etc/passwd — fails the prefix check despite
+        resolving to /etc/passwd.
+
+   security_file_open fires AFTER dentry resolution but BEFORE the fd is
+   returned to userspace. bpf_d_path() can reconstruct the canonical absolute
+   path from the resolved struct path. We classify that and OR the result
+   into open_scratch[pid_tgid] so tp_openat_exit picks it up at fd_track
+   insertion time.
+
+   Requires CONFIG_BPF_LSM=y and "bpf" in the active LSM list (same
+   prerequisite as Section 6). If unavailable, the loader skips attaching
+   this program and only the tracepoint-string classifier runs.
+   ════════════════════════════════════════════════════════════════════════════ */
+
+/*
+ * lsm_file_open_classify — classify the resolved canonical path.
+ *
+ * bpf_d_path is a GPL-only helper available on hooks in the kernel's
+ * d_path BTF allowlist; security_file_open is on that list for both
+ * 5.15 and 6.x kernels (the akmon support window).
+ *
+ * Side effect: merges risk_flags into open_scratch[pid_tgid].
+ * tp_openat_exit reads this entry and uses its risk_flags to decide
+ * whether to add the fd to fd_track. Result: an openat through a
+ * symlinked or dirfd-relative path is correctly tracked.
+ *
+ * Always returns 0 — this hook only enriches, never denies.
+ */
+SEC("lsm/file_open")
+int BPF_PROG(lsm_file_open_classify, struct file *file)
+{
+    __u32 zero = 0;
+    char *buf = bpf_map_lookup_elem(&path_heap, &zero);
+    if (!buf)
+        return 0;
+
+    long n = bpf_d_path(&file->f_path, buf, MAX_PATH_LEN);
+    if (n <= 0)
+        return 0;
+
+    __u32 flags = classify_path_buf(buf);
+    if (!flags)
+        return 0;
+
+    flags |= RFLAG_CANONICAL;
+
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct fd_val *cur = bpf_map_lookup_elem(&open_scratch, &pid_tgid);
+    if (cur) {
+        /*
+         * tp_openat_enter already wrote a scratch entry. OR the canonical
+         * classification into it so tp_openat_exit sees the union of both.
+         * The canonical path replaces the user-supplied string so the
+         * downstream file_event reports the real resolved file.
+         */
+        cur->risk_flags |= flags;
+        bpf_probe_read_kernel_str(cur->path, MAX_PATH_LEN, buf);
+        return 0;
+    }
+    return 0;
+}
+
 char LICENSE[] SEC("license") = "GPL";

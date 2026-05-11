@@ -50,6 +50,10 @@ const (
 	RFlagSensitive uint32 = 1 << 0
 	RFlagLargeMmap uint32 = 1 << 1
 	RFlagHTTP      uint32 = 1 << 2
+	RFlagSSHKey    uint32 = 1 << 3
+	RFlagK8sSecret uint32 = 1 << 4
+	RFlagCloudCred uint32 = 1 << 5
+	RFlagCanonical uint32 = 1 << 6
 )
 
 // ══════════════════════════════════════════════════════════════════════════

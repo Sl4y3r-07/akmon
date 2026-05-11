@@ -34,10 +34,14 @@
 #define EVENT_TLS_SEND      8   /* SSL_write plaintext peek (pre-encryption) */
 #define EVENT_TLS_RECV      9   /* SSL_read plaintext peek (post-decryption) */
 
-/* ── Risk Flags (set in kernel, further enriched in Go userspace) ────────── */
-#define RFLAG_SENSITIVE     (1 << 0)  /* /etc/ /proc/ /sys/ /.ssh/ prefix    */
-#define RFLAG_LARGE_MMAP    (1 << 1)  /* mmap > 100 MB → likely model load   */
-#define RFLAG_HTTP          (1 << 2)  /* HTTP method detected in send buffer  */
+/* ── Risk Flags (set in kernel, further enriched in Go userspace) ───────── */
+#define RFLAG_SENSITIVE     (1 << 0)  /* sensitive path (any of the below)   */
+#define RFLAG_LARGE_MMAP    (1 << 1)  /* mmap > 100 MB -> likely model load  */
+#define RFLAG_HTTP          (1 << 2)  /* HTTP method detected in send buffer */
+#define RFLAG_SSH_KEY       (1 << 3)  /* path contains /.ssh/                */
+#define RFLAG_K8S_SECRET    (1 << 4)  /* /run/secrets/ or kubernetes.io SA   */
+#define RFLAG_CLOUD_CRED    (1 << 5)  /* /.aws/ /.kube/ /.config/gcloud/     */
+#define RFLAG_CANONICAL     (1 << 6)  /* classification used resolved dentry */
 
 /* ── Rate Limiting ───────────────────────────────────────────────────────── */
 #define RATE_MAX            100              /* max events per pid per window  */
