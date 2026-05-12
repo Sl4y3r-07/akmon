@@ -9,7 +9,7 @@
 # The output is checked into the repo so CI can build without BTF tools.
 #
 # Requirements:
-#   - bpftool >= 5.13  (ships with linux-tools-$(uname -r) on Ubuntu)
+#   - bpftool >= 5.13  (see scripts/bpftool_resolve.sh for discovery + apt/dnf hints)
 #   - /sys/kernel/btf/vmlinux must exist (CONFIG_DEBUG_INFO_BTF=y)
 #
 # Usage:
@@ -36,21 +36,13 @@ fi
 echo "[*] BTF found: /sys/kernel/btf/vmlinux"
 echo "[*] Kernel: $(uname -r)"
 
-# Find bpftool
-BPFTOOL=""
-for candidate in bpftool \
-                 /usr/sbin/bpftool \
-                 "/usr/lib/linux-tools/$(uname -r)/bpftool" \
-                 "$(find /usr/lib/linux-tools -maxdepth 2 -name bpftool -type f 2>/dev/null | sort -r | head -n1)"; do
-    if command -v "$candidate" &>/dev/null 2>&1; then
-        BPFTOOL="$candidate"
-        break
-    fi
-done
+SDIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+# shellcheck source=bpftool_resolve.sh
+source "$SDIR/bpftool_resolve.sh"
 
-if [ -z "$BPFTOOL" ]; then
-    echo "[!] bpftool not found. Install it with:"
-    echo "    sudo apt-get install -y linux-tools-$(uname -r) linux-tools-common"
+BPFTOOL=""
+if ! BPFTOOL=$(bpftool_find_path); then
+    bpftool_print_install_hint
     exit 1
 fi
 

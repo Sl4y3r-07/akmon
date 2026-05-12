@@ -19,5 +19,10 @@ tests/logs/
 *~
 
 ui/node_modules/
+
+# for make clean-deps
+.akmon-deps-apt.list
+.akmon-deps-snap.list
+
 ui/dist/
 internal/graphapi/static/assets/

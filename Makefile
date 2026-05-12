@@ -1,20 +1,22 @@
 # Makefile — Akmon
 #
 # Build pipeline:
-#   1. gen-vmlinux : generate bpf/vmlinux.h from running kernel BTF
-#   2. bpf         : compile monitor.bpf.c → monitor.bpf.o (eBPF bytecode)
-#   3. ui          : build React dashboard (Vite) → internal/graphapi/static/
-#   4. build       : compile Go daemon binary (embeds the built UI)
-#   5. install     : install binary, BPF object, templates from akmon-templates + systemd unit
+#   1. deps        : verify build/runtime tools (Debian/Ubuntu: installs missing apt packages by default)
+#   2. gen-vmlinux : generate bpf/vmlinux.h from running kernel BTF
+#   3. bpf         : compile monitor.bpf.c → monitor.bpf.o (eBPF bytecode)
+#   4. ui          : build React dashboard (Vite) → internal/graphapi/static/
+#   5. build       : deps + gen-vmlinux + bpf + ui + Go binary
+#   6. install     : install binary, BPF object, templates from akmon-templates + systemd unit
 #
 # Targets:
-#   make deps          — check all build/runtime dependencies
+#   make deps          — check deps; on Debian/Ubuntu installs missing apt packages (INSTALL_DEPS=0 to skip)
 #   make gen-vmlinux   — generate bpf/vmlinux.h (run once per kernel upgrade)
 #   make bpf           — compile only the eBPF C programs
 #   make ui            — build the React dashboard (requires Node.js ≥ 18)
-#   make build         — full build (bpf + ui + go binary)
+#   make build         — full build (deps + gen-vmlinux + bpf + ui + go binary)
 #   make build-no-ui   — build without rebuilding the React UI
 #   make clean         — remove all generated files
+#   make clean-deps    — remove ui/node_modules + Akmon build apt/snap toolchain (see scripts/clean_deps.sh)
 #   make run           — build and run as root (requires root)
 #   make fmt           — format Go and C source files
 #   make install       — install as systemd service (then: sudo make enable)
@@ -67,10 +69,19 @@ BPF_CFLAGS := \
 all: build
 
 # ── Dependency check ─────────────────────────────────────────────────────────
+# INSTALL_DEPS=1 (default): on Debian/Ubuntu, `make deps` runs apt-get for missing
+# build packages (requires sudo). Check only: `make deps INSTALL_DEPS=0`.
+# Use `=` (not `?=`) so an empty INSTALL_DEPS in the environment does not disable apt.
+INSTALL_DEPS = 1
+
 .PHONY: deps
 deps:
-	@echo "==> Checking dependencies..."
-	@bash scripts/check_deps.sh
+	@echo "==> Checking dependencies (INSTALL_DEPS=$(INSTALL_DEPS))..."
+	@INSTALL_DEPS=$(INSTALL_DEPS) bash scripts/check_deps.sh || { \
+		echo ""; \
+		echo "==> deps failed: fix remaining issues above (kernel/BTF, Go version, or sudo for apt)."; \
+		exit 1; \
+	}
 
 # ── Generate vmlinux.h ───────────────────────────────────────────────────────
 # Must be run on the target machine (needs /sys/kernel/btf/vmlinux).
@@ -78,7 +89,12 @@ deps:
 .PHONY: gen-vmlinux
 gen-vmlinux:
 	@echo "==> Generating bpf/vmlinux.h from kernel BTF..."
-	@bash scripts/gen_vmlinux.sh
+	@bash scripts/gen_vmlinux.sh || { \
+		echo ""; \
+		echo "==> gen-vmlinux failed: need /sys/kernel/btf/vmlinux and bpftool (see script output above)."; \
+		echo "    Re-run after installing bpftool or switching to a BTF-enabled kernel."; \
+		exit 1; \
+	}
 	@echo "==> vmlinux.h generated."
 
 # ── Compile eBPF C programs ───────────────────────────────────────────────────
@@ -106,9 +122,13 @@ ui:
 # ── Build Go binary ───────────────────────────────────────────────────────────
 # The Go loader reads monitor.bpf.o from disk (no bpf2go code generation step).
 # We copy the compiled BPF object next to the binary so they deploy together.
-# `build` rebuilds the React UI first so the embedded assets are always fresh.
+# `build` is the one-shot target: deps → gen-vmlinux → bpf → UI → Go binary (+ bundled BPF).
+.PHONY: build-banner
+build-banner:
+	@echo "==> make build — deps -> gen-vmlinux -> bpf -> ui -> Go (one command)"
+
 .PHONY: build
-build: bpf ui
+build: build-banner deps gen-vmlinux bpf ui
 	@echo "==> Building Go daemon..."
 	@mkdir -p bin
 	CGO_ENABLED=0 $(GO) build \
@@ -121,7 +141,7 @@ build: bpf ui
 
 # ── Build Go binary only (skip UI rebuild) ───────────────────────────────────
 .PHONY: build-no-ui
-build-no-ui: bpf
+build-no-ui: deps gen-vmlinux bpf
 	@echo "==> Building Go daemon (skipping UI rebuild)..."
 	@mkdir -p bin
 	CGO_ENABLED=0 $(GO) build \
@@ -133,14 +153,14 @@ build-no-ui: bpf
 
 # ── Build only the eBPF object (no Go) ───────────────────────────────────────
 .PHONY: bpf-only
-bpf-only: $(BPF_OBJ)
+bpf-only: deps gen-vmlinux $(BPF_OBJ)
 	@echo "==> eBPF-only build complete."
 
 # ── Verify the eBPF object (dry-run load) ────────────────────────────────────
 # Uses bpftool to verify the program without actually loading it.
 # The trap ensures the pinned path is cleaned up even if bpftool is interrupted.
 .PHONY: verify
-verify: $(BPF_OBJ)
+verify: deps gen-vmlinux $(BPF_OBJ)
 	@echo "==> Verifying eBPF program with bpftool..."
 	@trap 'rm -f /sys/fs/bpf/akmon_verify' EXIT INT TERM; \
 	 $(BPFTOOL) prog load $(BPF_OBJ) /sys/fs/bpf/akmon_verify type tracepoint 2>&1 \
@@ -170,7 +190,7 @@ TEMPLATES_SRC ?= ../akmon-templates
 # Requires: $(TEMPLATES_SRC)/behavioral-templates and $(TEMPLATES_SRC)/nuclei-templates
 # After install: sudo systemctl enable --now akmon
 .PHONY: install
-install: deps gen-vmlinux bpf build
+install: build
 	@test -d "$(TEMPLATES_SRC)/behavioral-templates" || ( \
 		echo "ERROR: $(TEMPLATES_SRC)/behavioral-templates not found."; \
 		echo "  Clone akmon-templates next to akmon, or run: sudo make install TEMPLATES_SRC=/path/to/akmon-templates"; \
@@ -273,6 +293,10 @@ distclean: clean
 	rm -f $(BPF_VMLINUX)
 	@echo "==> dist-clean complete."
 
+.PHONY: clean-deps
+clean-deps:
+	@bash scripts/clean_deps.sh
+
 # ── Help ─────────────────────────────────────────────────────────────────────
 .PHONY: help
 help:
@@ -295,6 +319,7 @@ help:
 	@echo "  fmt           Format Go and C source files"
 	@echo "  lint          Run golangci-lint"
 	@echo "  clean         Remove build artifacts"
+	@echo "  clean-deps    Remove ui/node_modules + Akmon build apt/snap toolchain (destructive)"
 	@echo "  distclean     Remove all generated files including vmlinux.h"
 	@echo ""
 	@echo "Quick start:"
