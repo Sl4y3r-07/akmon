@@ -97,7 +97,7 @@ YAML detection rules are **not** in this repository. You will usually want the s
 
 ### Local development (no system install)
 
-Clone both repos, build, and run from your workspace:
+Clone both repos, then build from the `akmon` directory:
 
 ```bash
 git clone https://github.com/ClawGuard-Labs/akmon
@@ -245,15 +245,20 @@ See [Detection Templates](#detection-templates) for authoring and rule bundles.
 ## Build Targets
 
 ```bash
-make build          # Compile Go binary + embed eBPF object → bin/akmon
-make bpf            # Recompile eBPF C → bpf/monitor.bpf.o  (needs clang)
-make deps           # check all build/runtime dependencies
+make build          # deps + gen-vmlinux + eBPF + UI + Go -> bin/akmon
+make build-no-ui    # Same without rebuilding the React UI (faster iteration)
+make bpf            # Recompile eBPF C -> bpf/monitor.bpf.o  (needs vmlinux.h + clang)
+make deps           # Check deps; on Debian/Ubuntu installs missing apt packages (sudo)
 make gen-vmlinux    # Regenerate vmlinux.h from kernel BTF   (once per kernel)
-make ui             # build the React dashboard (requires Node.js ≥ 18)
+make ui             # Build the React dashboard (requires Node.js ≥ 18)
 make run            # Build and run as root
-make install        # Install to /usr/local/bin/akmon
-make clean          # Remove bin/
-make lint           # Run golangci-lint
+make install        # Install binary, BPF, templates path, systemd + logrotate (see below)
+make clean          # Remove bpf/monitor.bpf.o, bin/, embedded UI assets (keeps vmlinux.h, ui/node_modules)
+make distclean      # make clean + remove bpf/vmlinux.h
+make clean-deps     # cleans ui/node_modules + Akmon-related apt/snap toolchain (destructive)
+make test           # go test under tests/
+make fmt            # go fmt + clang-format on bpf/
+make lint           # golangci-lint
 ```
 
 ---
@@ -512,9 +517,9 @@ akmon/
 ├── bpf/
 │   ├── monitor.bpf.c          # eBPF kernel programs (syscall tracepoints)
 │   ├── common.h               # Shared kernel/userspace structs and constants
-│   ├── vmlinux.h              # BTF-generated kernel headers (CO-RE); see scripts/gen_vmlinux.sh
-│   └── monitor.bpf.o          # produced by `make build` (also under bin/ when copied)
-├── bin/                       # local build outputs: akmon, monitor.bpf.o (often gitignored)
+│   ├── vmlinux.h              # BTF-generated kernel headers (CO-RE); from scripts/gen_vmlinux.sh
+│   └── monitor.bpf.o          # eBPF object from `make bpf` / `make build` (also copied under bin/)
+├── bin/                       # Local build outputs: akmon, monitor.bpf.o (gitignored when built)
 ├── cmd/monitor/
 │   └── main.go                # Entry point, flags, config.yaml load, pipeline wiring
 ├── internal/
@@ -526,25 +531,34 @@ akmon/
 │   ├── correlator/            # PID tracking, session assignment
 │   ├── detector/              # Behavioral YAML loader + Analyze()
 │   ├── graph/                 # In-memory graph + snapshots + SSE subscribers
-│   ├── graphapi/              # Dashboard HTTP server (--ui); embeds Vite build
+│   ├── graphapi/              # Dashboard HTTP server (--ui); go:embed of Vite output
+│   │   └── static/            # Built UI assets (`make ui`); cleaned by `make clean`
 │   ├── loader/                # eBPF load, tracepoints, optional TLS uprobes / LSM
 │   ├── nucleiscanner/         # Nuclei v3 wrapper + localhost service probes
 │   ├── output/                # NDJSON, grouped writer, SSE mirror
 │   ├── provenance/            # Cross-session file / net_connect taint
 │   └── templates/             # Behavioral template YAML schema + loader
 ├── scripts/
-│   ├── akmon.service           # systemd unit (installed to /etc/systemd/system/)
-│   ├── logrotate.d/akmon
-│   ├── check_deps.sh
-│   └── gen_vmlinux.sh
+│   ├── docker/
+│   │   └── entrypoint.sh      # Optional helper for container images
+│   ├── akmon.service          # systemd unit (installed to /etc/systemd/system/)
+│   ├── logrotate.d/akmon      # logrotate snippet installed with `make install`
+│   ├── bpftool_resolve.sh     # bpftool discovery + apt package candidates (sourced by other scripts)
+│   ├── check_deps.sh          # Build/runtime dependency checks (`make deps`)
+│   ├── clean_deps.sh          # Toolchain + npm cleanup (`make clean-deps`)
+│   └── gen_vmlinux.sh         # Generate bpf/vmlinux.h (`make gen-vmlinux`)
 ├── tests/                     # `go test ./tests/...`
-├── ui/                        # Vite + React dashboard source
+├── ui/                        # Vite + React dashboard source (`npm install` / `make ui`)
 ├── assets/                    # Screenshots for this README
 ├── .github/                   # Issue/PR templates, CI workflows, CODEOWNERS
 ├── config.yaml                # Default AI profile; install copies to /etc/akmon/config.yaml
-├── Dockerfile.dev             # Linux build/test toolchain (Go + clang + libbpf + Node)
+├── docker-compose.yml         # Local/runtime Compose stack (templates + config mounts)
+├── Dockerfile.dev             # Linux dev toolchain image (Go + clang + libbpf + Node)
+├── Dockerfile.runtime         # Minimal runtime image (loads eBPF on host kernel)
 ├── go.mod
+├── go.sum
 ├── Makefile
+├── .golangci.yml              # Lint config for `make lint`
 ├── README.md
 ├── CONTRIBUTING.md
 ├── CODE_OF_CONDUCT.md
@@ -606,7 +620,7 @@ Your kernel wasn't built with `CONFIG_DEBUG_INFO_BTF=y`. Stock Ubuntu 22.04/24.0
 You need one of: run as root, or grant `CAP_BPF`, `CAP_PERFMON`, `CAP_NET_ADMIN` via `setcap cap_bpf,cap_perfmon,cap_net_admin+eip ./bin/akmon`. Some distros also require `sysctl kernel.unprivileged_bpf_disabled=0` for non-root operation.
 
 **`clang: command not found` when running `make bpf`.**
-Install the eBPF toolchain: `sudo apt-get install -y clang llvm libbpf-dev linux-tools-$(uname -r) linux-tools-common`.
+Install the eBPF toolchain (paths vary by kernel flavor): run **`make deps`** or see **`scripts/bpftool_resolve.sh`** for `apt`/`dnf` hints (`linux-tools-<uname -r>`, `linux-tools-azure`, `linux-cloud-tools-*`, `linux-tools-generic`, `bpftool`, etc.).
 
 **I'm on macOS and `make build` fails.**
 Akmon is Linux-only at runtime. Use `Dockerfile.dev` to build in a container (see [Build on macOS](#build-on-macos-via-docker)), and run the binary on a Linux host.
